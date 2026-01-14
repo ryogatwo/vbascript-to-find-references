@@ -1,0 +1,559 @@
+Option Compare Database
+Option Explicit
+
+Private gSearchTerm As String   'Search term written into every results row
+
+
+'===================================================================================================
+' modRefScan_ExactNameOnly
+'===================================================================================================
+' DROP-IN REPLACEMENT MODULE
+'
+' GOAL
+'   Find where a given table (or any object name) is referenced anywhere in the CURRENT Access DB.
+'   Output results to a single table in the CURRENT DB:
+'
+'       zRefScanResults
+'
+'   This module DOES NOT create any reports and DOES NOT create any new databases.
+'
+' OUTPUT TABLE (recreated every run)
+'   zRefScanResults fields:
+'     - ID            (AutoNumber PK)
+'     - SearchTerm    (what you searched for)
+'     - FoundIn       (Query / Form / Report / Macro / Code / TableDef)
+'     - ObjectName    (e.g. query name, form name, module name)
+'     - SubObject     (e.g. control name)
+'     - PropertyName  (SQL / RecordSource / ControlSource / RowSource / Connect / etc.)
+'     - MatchContext  (snipped text around the match)
+'
+' EXACT-NAME-ONLY MATCHING RULES
+'   ✔ Matches: [cim-orders_local]
+'   ✔ Matches: dbo.[cim-orders_local]
+'   ✔ Matches: cim-orders_local       (ONLY if standalone token)
+'   ✘ Does NOT match: cim-orders_local_backup
+'   ✘ Does NOT match: [cim-orders_local_backup]
+'
+' IMPORTANT ABOUT NAMES WITH DASHES (-)
+'   In Access SQL, names with dashes are normally bracketed: [cim-orders_local]
+'   This scanner matches BOTH bracketed and standalone-token cases.
+'
+'===================================================================================================
+' STEP-BY-STEP INSTALL (DO THIS ONCE)
+'===================================================================================================
+' 1) In Access, press ALT+F11 to open the VBA editor.
+' 2) Insert > Module.
+' 3) Paste EVERYTHING from this file into that module.
+' 4) Save the module as: modRefScan_ExactNameOnly   (name not required, but recommended)
+' 5) Close the VBA editor.
+'
+'===================================================================================================
+' STEP-BY-STEP RUN (EVERY TIME)
+'===================================================================================================
+' OPTION A (Prompt):
+'   - In Access: Database Tools > Macros > Run VBA (or press ALT+F8)
+'   - Run: RefScan_Prompt
+'
+' OPTION B (Direct from Immediate Window):
+'   - ALT+F11, then CTRL+G to open Immediate Window
+'   - Type:
+'       Call RefScan_Run("cim-orders_local")
+'     then press Enter.
+'
+' AFTER RUNNING
+'   - The table zRefScanResults is recreated and filled.
+'   - The code auto-opens the results table at the end.
+'
+'===================================================================================================
+' PERFORMANCE / SAFETY NOTES
+'===================================================================================================
+' - Forms/Reports are opened in Design View (hidden) to reliably read RecordSource/ControlSource/etc.
+'   That can take time in large databases.
+' - Scanning Macros/Modules uses Application.SaveAsText, which can be blocked by some Trust Center
+'   policies. If blocked, those sections will simply produce fewer results (no crash).
+' - This is a text scan. It can find references inside comments/strings too. That’s usually fine.
+'===================================================================================================
+
+
+'=========================================================================================
+' PUBLIC ENTRY POINTS
+'=========================================================================================
+
+' Prompted run (easy button).
+Public Sub RefScan_Prompt()
+    Dim target As String
+    target = Trim$(Nz(InputBox( _
+        "Enter the EXACT table/object name to find references for:" & vbCrLf & _
+        "Examples:" & vbCrLf & _
+        "  cim-orders_local" & vbCrLf & _
+        "  dbo_CIM_web_orders" & vbCrLf & _
+        vbCrLf & _
+        "Matching is exact-name-only (won't match *_backup etc.)." & vbCrLf & _
+        "Brackets are optional.", _
+        "Reference Finder (Exact Name Only)"), ""))
+
+    If Len(target) = 0 Then Exit Sub
+    RefScan_Run target
+End Sub
+
+' Direct run:
+'   Call RefScan_Run("cim-orders_local")
+Public Sub RefScan_Run(ByVal targetName As String)
+    ScanDatabaseForObjectNameExact targetName
+
+    ' Convenience: open the results table automatically
+    DoCmd.OpenTable "zRefScanResults", acViewNormal
+End Sub
+
+
+'=========================================================================================
+' MAIN SCANNER (TABLE OUTPUT ONLY)
+'=========================================================================================
+Private Sub ScanDatabaseForObjectNameExact(ByVal targetName As String)
+    Dim db As DAO.Database
+    Set db = CurrentDb
+
+    Dim plainName As String
+    plainName = NormalizeObjectName(targetName) ' strips outer [ ] if present
+
+    If Len(plainName) = 0 Then
+        MsgBox "No search term provided.", vbExclamation
+        Exit Sub
+    End If
+
+    ' Recreate output table fresh every run
+    RecreateResultsTable
+
+    ' Store the search term once (used for every row)
+    gSearchTerm = plainName
+
+    ' Scan everything
+    ScanQueries db, plainName
+    ScanForms plainName
+    ScanReports plainName
+    ScanMacros plainName
+    ScanModules plainName
+    ScanTableDefs db, plainName
+
+    ' Optional: show completion count
+    MsgBox "Reference scan complete for: " & plainName & vbCrLf & _
+           "Results written to table: zRefScanResults", vbInformation
+End Sub
+
+
+'=========================================================================================
+' OUTPUT TABLE (DROP/CREATE) + INSERTS
+'=========================================================================================
+Private gSearchTerm As String  ' used to write SearchTerm into every row
+
+' Drops and recreates zRefScanResults in the CURRENT database.
+Private Sub RecreateResultsTable()
+    Dim db As DAO.Database
+    Set db = CurrentDb
+
+    ' Drop if exists
+    On Error Resume Next
+    db.Execute "DROP TABLE zRefScanResults;", dbFailOnError
+    Err.Clear
+    On Error GoTo 0
+
+    ' Create fresh
+    db.Execute _
+        "CREATE TABLE zRefScanResults (" & _
+        "   ID AUTOINCREMENT CONSTRAINT PK_zRefScanResults PRIMARY KEY," & _
+        "   SearchTerm TEXT(255)," & _
+        "   FoundIn TEXT(50)," & _
+        "   ObjectName TEXT(255)," & _
+        "   SubObject TEXT(255)," & _
+        "   PropertyName TEXT(50)," & _
+        "   MatchContext LONGTEXT" & _
+        ");", dbFailOnError
+
+    ' Helpful indexes for filtering/sorting
+    On Error Resume Next
+    db.Execute "CREATE INDEX IX_zRefScanResults_1 ON zRefScanResults (FoundIn, ObjectName);", dbFailOnError
+    db.Execute "CREATE INDEX IX_zRefScanResults_2 ON zRefScanResults (SearchTerm);", dbFailOnError
+    On Error GoTo 0
+End Sub
+
+' Inserts one hit row into zRefScanResults.
+Private Sub AddHit(ByVal foundIn As String, ByVal objectName As String, _
+                   Optional ByVal subObject As String = "", _
+                   Optional ByVal propName As String = "", _
+                   Optional ByVal context As String = "")
+    Dim db As DAO.Database
+    Set db = CurrentDb
+
+    db.Execute _
+        "INSERT INTO zRefScanResults (SearchTerm, FoundIn, ObjectName, SubObject, PropertyName, MatchContext) " & _
+        "VALUES (" & SqlText(gSearchTerm) & "," & SqlText(foundIn) & "," & SqlText(objectName) & "," & _
+                  SqlText(subObject) & "," & SqlText(propName) & "," & SqlMemo(context) & ");", _
+        dbFailOnError
+End Sub
+
+Private Function SqlText(ByVal s As String) As String
+    SqlText = "'" & Replace(Nz(s, ""), "'", "''") & "'"
+End Function
+
+Private Function SqlMemo(ByVal s As String) As String
+    SqlMemo = "'" & Replace(Nz(s, ""), "'", "''") & "'"
+End Function
+
+
+'=========================================================================================
+' EXACT-NAME-ONLY MATCHING HELPERS (NO LOOKBEHIND)
+'=========================================================================================
+
+' Accepts:
+'   cim-orders_local
+'   [cim-orders_local]
+' Returns:
+'   cim-orders_local
+Private Function NormalizeObjectName(ByVal s As String) As String
+    s = Trim$(Nz(s, ""))
+    If Len(s) >= 2 Then
+        If Left$(s, 1) = "[" And Right$(s, 1) = "]" Then
+            s = Mid$(s, 2, Len(s) - 2)
+        End If
+    End If
+    NormalizeObjectName = Trim$(s)
+End Function
+
+' True if haystack contains an EXACT reference to namePlain:
+'   1) Bracketed: [namePlain]
+'   2) Quoted:    "namePlain"
+'   3) Token:     (^|nonword) namePlain (nonword|$)
+' where "word" is defined as [A-Za-z0-9_]
+Private Function ContainsTargetExact(ByVal haystack As String, ByVal namePlain As String) As Boolean
+    Dim h As String, n As String
+    h = LCase$(Nz(haystack, ""))
+    n = LCase$(Nz(namePlain, ""))
+
+    If Len(n) = 0 Or Len(h) = 0 Then
+        ContainsTargetExact = False
+        Exit Function
+    End If
+
+    ' Fast paths (common in Access SQL / exports)
+    If InStr(1, h, "[" & n & "]", vbBinaryCompare) > 0 Then
+        ContainsTargetExact = True
+        Exit Function
+    End If
+
+    If InStr(1, h, """" & n & """", vbBinaryCompare) > 0 Then
+        ContainsTargetExact = True
+        Exit Function
+    End If
+
+    ' Regex boundary test WITHOUT lookbehind (VBScript.RegExp has no lookbehind)
+    Dim re As Object
+    Set re = GetRegex()
+    re.Pattern = "(^|[^A-Za-z0-9_])" & EscapeRegex(n) & "([^A-Za-z0-9_]|$)"
+    ContainsTargetExact = re.Test(h)
+End Function
+
+' Finds the 1-based match position for context-snipping; returns 0 if not found.
+Private Function FirstMatchPos(ByVal haystack As String, ByVal namePlain As String) As Long
+    Dim t As String, l As String, n As String
+    t = Nz(haystack, "")
+    l = LCase$(t)
+    n = LCase$(Nz(namePlain, ""))
+
+    If Len(n) = 0 Or Len(l) = 0 Then
+        FirstMatchPos = 0
+        Exit Function
+    End If
+
+    Dim p As Long
+    p = InStr(1, l, "[" & n & "]", vbBinaryCompare)
+    If p > 0 Then
+        FirstMatchPos = p
+        Exit Function
+    End If
+
+    p = InStr(1, l, """" & n & """", vbBinaryCompare)
+    If p > 0 Then
+        FirstMatchPos = p
+        Exit Function
+    End If
+
+    Dim re As Object, matches As Object, m As Object
+    Set re = GetRegex()
+    re.Pattern = "(^|[^A-Za-z0-9_])" & EscapeRegex(n) & "([^A-Za-z0-9_]|$)"
+
+    Set matches = re.Execute(l)
+    If matches.Count = 0 Then
+        FirstMatchPos = 0
+        Exit Function
+    End If
+
+    Set m = matches(0)
+
+    ' m.FirstIndex is 0-based and includes boundary char. Find where name starts within m.Value.
+    Dim v As String, idxInV As Long
+    v = LCase$(m.Value)
+    idxInV = InStr(1, v, n, vbBinaryCompare) ' 1-based within m.Value
+    If idxInV = 0 Then
+        FirstMatchPos = 0
+    Else
+        FirstMatchPos = CLng(m.FirstIndex) + idxInV ' convert to 1-based overall position
+    End If
+End Function
+
+' Returns a snippet around the first match for readability.
+Private Function SnipContext(ByVal txt As String, ByVal namePlain As String, Optional ByVal radius As Long = 140) As String
+    Dim t As String
+    t = Nz(txt, "")
+
+    Dim p As Long
+    p = FirstMatchPos(t, namePlain)
+
+    If p = 0 Then
+        SnipContext = Left$(t, 255)
+        Exit Function
+    End If
+
+    Dim startPos As Long, endPos As Long
+    startPos = p - radius: If startPos < 1 Then startPos = 1
+    endPos = p + radius: If endPos > Len(t) Then endPos = Len(t)
+
+    SnipContext = Mid$(t, startPos, endPos - startPos + 1)
+End Function
+
+' Late-bound regex: no references needed.
+Private Function GetRegex() As Object
+    Static re As Object
+    If re Is Nothing Then
+        Set re = CreateObject("VBScript.RegExp")
+        re.Global = False
+        re.MultiLine = True
+        re.IgnoreCase = True
+    End If
+    Set GetRegex = re
+End Function
+
+' Escape regex meta characters so names like cim-orders_local are safe.
+Private Function EscapeRegex(ByVal s As String) As String
+    Dim specials As Variant, i As Long
+    specials = Array("\", ".", "^", "$", "|", "(", ")", "[", "]", "{", "}", "*", "+", "?", "-")
+
+    Dim out As String
+    out = s
+    For i = LBound(specials) To UBound(specials)
+        out = Replace(out, CStr(specials(i)), "\" & CStr(specials(i)))
+    Next i
+    EscapeRegex = out
+End Function
+
+
+'=========================================================================================
+' SCAN: QUERIES
+'=========================================================================================
+Private Sub ScanQueries(ByVal db As DAO.Database, ByVal namePlain As String)
+    Dim qdf As DAO.QueryDef
+    For Each qdf In db.QueryDefs
+
+        ' Skip temporary/internal queries
+        If Left$(qdf.Name, 1) <> "~" Then
+            On Error Resume Next
+            Dim sqlText As String
+            sqlText = qdf.SQL
+            On Error GoTo 0
+
+            If ContainsTargetExact(sqlText, namePlain) Then
+                AddHit "Query", qdf.Name, "", "SQL", SnipContext(sqlText, namePlain)
+            End If
+        End If
+    Next qdf
+End Sub
+
+
+'=========================================================================================
+' SCAN: FORMS
+'=========================================================================================
+Private Sub ScanForms(ByVal namePlain As String)
+    Dim ao As AccessObject
+    For Each ao In CurrentProject.AllForms
+
+        ' Open hidden in Design view to read RecordSource/ControlSource reliably
+        If ao.IsLoaded Then
+            ScanFormObject Forms(ao.Name), ao.Name, namePlain
+        Else
+            DoCmd.OpenForm ao.Name, acDesign, , , , acHidden
+            ScanFormObject Forms(ao.Name), ao.Name, namePlain
+            DoCmd.Close acForm, ao.Name, acSaveNo
+        End If
+    Next ao
+End Sub
+
+Private Sub ScanFormObject(ByVal frm As Access.Form, ByVal formName As String, ByVal namePlain As String)
+    On Error Resume Next
+
+    If ContainsTargetExact(frm.RecordSource, namePlain) Then
+        AddHit "Form", formName, "", "RecordSource", SnipContext(frm.RecordSource, namePlain)
+    End If
+
+    Dim ctl As Control
+    For Each ctl In frm.Controls
+        If ContainsTargetExact(ctl.ControlSource, namePlain) Then
+            AddHit "Form", formName, ctl.Name, "ControlSource", SnipContext(ctl.ControlSource, namePlain)
+        End If
+        If ContainsTargetExact(ctl.RowSource, namePlain) Then
+            AddHit "Form", formName, ctl.Name, "RowSource", SnipContext(ctl.RowSource, namePlain)
+        End If
+    Next ctl
+
+    On Error GoTo 0
+End Sub
+
+
+'=========================================================================================
+' SCAN: REPORTS
+'=========================================================================================
+Private Sub ScanReports(ByVal namePlain As String)
+    Dim ao As AccessObject
+    For Each ao In CurrentProject.AllReports
+
+        If ao.IsLoaded Then
+            ScanReportObject Reports(ao.Name), ao.Name, namePlain
+        Else
+            DoCmd.OpenReport ao.Name, acViewDesign, , , acHidden
+            ScanReportObject Reports(ao.Name), ao.Name, namePlain
+            DoCmd.Close acReport, ao.Name, acSaveNo
+        End If
+    Next ao
+End Sub
+
+Private Sub ScanReportObject(ByVal rpt As Access.Report, ByVal reportName As String, ByVal namePlain As String)
+    On Error Resume Next
+
+    If ContainsTargetExact(rpt.RecordSource, namePlain) Then
+        AddHit "Report", reportName, "", "RecordSource", SnipContext(rpt.RecordSource, namePlain)
+    End If
+
+    Dim ctl As Control
+    For Each ctl In rpt.Controls
+        If ContainsTargetExact(ctl.ControlSource, namePlain) Then
+            AddHit "Report", reportName, ctl.Name, "ControlSource", SnipContext(ctl.ControlSource, namePlain)
+        End If
+        If ContainsTargetExact(ctl.RowSource, namePlain) Then
+            AddHit "Report", reportName, ctl.Name, "RowSource", SnipContext(ctl.RowSource, namePlain)
+        End If
+    Next ctl
+
+    On Error GoTo 0
+End Sub
+
+
+'=========================================================================================
+' SCAN: MACROS (classic)
+'=========================================================================================
+Private Sub ScanMacros(ByVal namePlain As String)
+    Dim ao As AccessObject
+    For Each ao In CurrentProject.AllMacros
+        Dim tmpPath As String
+        tmpPath = Environ$("TEMP") & "\_macro_export_" & Replace(ao.Name, " ", "_") & ".txt"
+
+        On Error Resume Next
+        Application.SaveAsText acMacro, ao.Name, tmpPath
+        If Err.Number = 0 Then
+            Dim content As String
+            content = ReadAllText(tmpPath)
+
+            If ContainsTargetExact(content, namePlain) Then
+                AddHit "Macro", ao.Name, "", "Definition", SnipContext(content, namePlain, 200)
+            End If
+        End If
+        Err.Clear
+        On Error GoTo 0
+    Next ao
+End Sub
+
+
+'=========================================================================================
+' SCAN: VBA CODE (modules + code-behind)
+'=========================================================================================
+Private Sub ScanModules(ByVal namePlain As String)
+    Dim ao As AccessObject
+
+    ' Standard modules
+    For Each ao In CurrentProject.AllModules
+        ScanOneByExport acModule, ao.Name, namePlain
+    Next ao
+
+    ' Form class modules (code-behind)
+    For Each ao In CurrentProject.AllForms
+        ScanOneByExport acForm, ao.Name, namePlain
+    Next ao
+
+    ' Report class modules (code-behind)
+    For Each ao In CurrentProject.AllReports
+        ScanOneByExport acReport, ao.Name, namePlain
+    Next ao
+End Sub
+
+Private Sub ScanOneByExport(ByVal objType As AcObjectType, ByVal objName As String, ByVal namePlain As String)
+    Dim tmpPath As String
+    tmpPath = Environ$("TEMP") & "\_code_export_" & Replace(objName, " ", "_") & "_" & CStr(objType) & ".txt"
+
+    On Error Resume Next
+    Application.SaveAsText objType, objName, tmpPath
+    If Err.Number = 0 Then
+        Dim content As String
+        content = ReadAllText(tmpPath)
+
+        If ContainsTargetExact(content, namePlain) Then
+            AddHit "Code", objName, "", "SaveAsText", SnipContext(content, namePlain, 240)
+        End If
+    End If
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+
+'=========================================================================================
+' SCAN: TABLEDEFS (linked tables, connection strings, etc.)
+'=========================================================================================
+Private Sub ScanTableDefs(ByVal db As DAO.Database, ByVal namePlain As String)
+    Dim tdf As DAO.TableDef
+    For Each tdf In db.TableDefs
+        If Left$(tdf.Name, 4) <> "MSys" Then
+
+            ' Exact tabledef name match
+            If LCase$(tdf.Name) = LCase$(namePlain) Then
+                AddHit "TableDef", tdf.Name, "", "Name", tdf.Name
+            End If
+
+            ' Source table name and Connect can contain references (linked tables, ODBC, etc.)
+            If ContainsTargetExact(tdf.SourceTableName, namePlain) Then
+                AddHit "TableDef", tdf.Name, "", "SourceTableName", tdf.SourceTableName
+            End If
+
+            If ContainsTargetExact(tdf.Connect, namePlain) Then
+                AddHit "TableDef", tdf.Name, "", "Connect", SnipContext(tdf.Connect, namePlain, 200)
+            End If
+        End If
+    Next tdf
+End Sub
+
+
+'=========================================================================================
+' FILE UTILITY
+'=========================================================================================
+Private Function ReadAllText(ByVal filePath As String) As String
+    On Error GoTo CleanFail
+
+    Dim f As Integer
+    f = FreeFile
+
+    Open filePath For Binary Access Read As #f
+    ReadAllText = Space$(LOF(f))
+    Get #f, , ReadAllText
+    Close #f
+    Exit Function
+
+CleanFail:
+    On Error Resume Next
+    Close #f
+    ReadAllText = ""
+End Function
