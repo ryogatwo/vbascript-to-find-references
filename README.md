@@ -11,13 +11,13 @@ OUTPUT TABLE (recreated every run)
    zRefScanResults fields:
 
 ```
-   \- ID (AutoNumber PK)
-   \- SearchTerm (what you searched for)
-   \- FoundIn (Query / Form / Report / Macro / Code / TableDef)
-   \- ObjectName (e.g. query name, form name, module name)
-   \- SubObject (e.g. control name)
-   \- PropertyName (SQL / RecordSource / ControlSource / RowSource / Connect / etc.)
-   \- MatchContext (snipped text around the match)
+   - ID (AutoNumber PK)
+   - SearchTerm (what you searched for)
+   - FoundIn (Query / Form / Report / Macro / Code / TableDef)
+   - ObjectName (e.g. query name, form name, module name)
+   - SubObject (e.g. control name)
+   - PropertyName (SQL / RecordSource / ControlSource / RowSource / Connect / etc.)
+   - MatchContext (snipped text around the match)
 ```
 
 EXACT-NAME-ONLY MATCHING RULES
