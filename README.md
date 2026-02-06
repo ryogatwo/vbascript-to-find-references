@@ -9,7 +9,8 @@ This module DOES NOT create any reports and DOES NOT create any new databases.
 OUTPUT TABLE (recreated every run)
 
    zRefScanResults fields:
-   
+
+```
    \- ID (AutoNumber PK)
    \- SearchTerm (what you searched for)
    \- FoundIn (Query / Form / Report / Macro / Code / TableDef)
@@ -17,14 +18,17 @@ OUTPUT TABLE (recreated every run)
    \- SubObject (e.g. control name)
    \- PropertyName (SQL / RecordSource / ControlSource / RowSource / Connect / etc.)
    \- MatchContext (snipped text around the match)
+```
 
 EXACT-NAME-ONLY MATCHING RULES
 
+```
 ✔ Matches: \[cim-orders\_local\]
 ✔ Matches: dbo.\[cim-orders\_local\]
 ✔ Matches: cim-orders\_local (ONLY if standalone token)
 ✘ Does NOT match: cim-orders\_local\_backup
 ✘ Does NOT match: \[cim-orders\_local\_backup\]
+```
 
 IMPORTANT ABOUT NAMES WITH DASHES (-)
 
